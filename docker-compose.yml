@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      - "--log.level=DEBUG"
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--certificatesresolvers.myresolver.acme.httpchallenge=true"
+      - "--certificatesresolvers.myresolver.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.myresolver.acme.email=${EMAIL_ADDRESS}"
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "${TRAEFIK_HTTP_PORT:-80}:80"
+      - "${TRAEFIK_HTTPS_PORT:-443}:443"
+      # - "8080:8080" # Uncomment to expose Traefik dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - letsencrypt:/letsencrypt
+    networks:
+      - proxy
+
+  webhook-listener:
+    build: .
+    container_name: webhook-listener
+    restart: unless-stopped
+    environment:
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
+      - DOMAIN_NAME=${DOMAIN_NAME}
+      - PRODUCTION_BRANCH=${PRODUCTION_BRANCH:-refs/heads/main}
+      - EXTERNAL_SSL_PROXY=${EXTERNAL_SSL_PROXY:-false}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - PROXY_NETWORK=proxy
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_ALLOWED_NUMBER=${TELEGRAM_ALLOWED_NUMBER}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock # Required to spin up sibling containers
+      - ./repo-data:/tmp/repos # Persist repository clones across restarts
+    ports:
+      - "${WEBHOOK_PORT:-3000}:3000"
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    name: proxy
+
+volumes:
+  letsencrypt:

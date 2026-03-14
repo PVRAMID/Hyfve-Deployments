@@ -1,0 +1,17 @@
+{
+  "name": "mini-paas-webhook-listener",
+  "version": "1.0.0",
+  "description": "HYFVE Deploy - Self-Hosted PaaS. Developed by Joshua Lewis",
+  "main": "index.js",
+  "author": "HYFVE (Joshua Lewis)",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "setup": "node install.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.0",
+    "node-telegram-bot-api": "^0.65.0"
+  }
+}
