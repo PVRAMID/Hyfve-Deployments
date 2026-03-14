@@ -51,6 +51,11 @@ async function runInstaller() {
   const branch = await askQuestion('Production Branch to listen to:', existingConfig.PRODUCTION_BRANCH || 'refs/heads/main');
   const githubToken = await askQuestion('GitHub Personal Access Token (Optional for Private Repos):', existingConfig.GITHUB_TOKEN || '');
   
+  console.log('\n\x1b[36m--- Desktop App API Key ---\x1b[0m');
+  console.log('The API Key allows the HYFVE Desktop app to securely connect to this server.');
+  const defaultApiKey = existingConfig.API_KEY || generateSecret();
+  let apiKey = await askQuestion('API Key (Press Enter to keep the generated one):', defaultApiKey);
+
   console.log('\n\x1b[36m--- Telegram Bot Configuration ---\x1b[0m');
   const tgToken = await askQuestion('Telegram Bot Token (From @BotFather):', existingConfig.TELEGRAM_BOT_TOKEN || '');
   const tgNumber = await askQuestion('Your Phone Number (e.g., +44 74 9402 6659):', existingConfig.TELEGRAM_ALLOWED_NUMBER || '');
@@ -157,6 +162,9 @@ ${githubToken ? `GITHUB_TOKEN=${githubToken}` : ''}
 # Telegram integration
 TELEGRAM_BOT_TOKEN=${tgToken}
 TELEGRAM_ALLOWED_NUMBER=${tgNumber}
+
+# Desktop App API Key
+API_KEY=${apiKey}
 
 # Ports & Architecture
 EXTERNAL_SSL_PROXY=${externalProxy}

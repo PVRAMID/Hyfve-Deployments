@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { EventEmitter } = require('events');
 const TelegramBot = require('node-telegram-bot-api');
 
 const app = express();
@@ -10,6 +11,11 @@ const PORT = process.env.PORT || 3000;
 const SECRET = process.env.GITHUB_WEBHOOK_SECRET;
 const DOMAIN = process.env.DOMAIN_NAME || 'mydomain.com';
 const PROXY_NETWORK = process.env.PROXY_NETWORK || 'proxy';
+const API_KEY = process.env.API_KEY;
+
+// --- Active Deployments (SSE Log Streaming) ---
+// Map<deployId, { repoName, cloneUrl, status, emitter, logs[] }>
+const activeDeployments = new Map();
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_ALLOWED_NUMBER = process.env.TELEGRAM_ALLOWED_NUMBER;
@@ -220,13 +226,182 @@ app.post('/webhook', (req, res) => {
   sendTelegram(`🔔 New Push Detected!\n\nRepository: ${repoName}\nBranch: ${prodBranch.replace('refs/heads/', '')}\nPushed by: ${author}\n\nMessage: ${commitMsg}\n\nWould you like to deploy this update?`, opts);
 });
 
+// =============================================
+//   REST API — Desktop App Integration Layer
+// =============================================
+
+const requireApiKey = (req, res, next) => {
+  if (!API_KEY) {
+    return res.status(503).json({ error: 'API_KEY is not configured on the server.' });
+  }
+  const key = req.headers['x-api-key'];
+  if (!key || key !== API_KEY) {
+    return res.status(401).json({ error: 'Invalid or missing API key.' });
+  }
+  next();
+};
+
+// Health check — also used by desktop to test connection
+app.get('/api/health', requireApiKey, (req, res) => {
+  res.json({ status: 'ok', domain: DOMAIN, timestamp: Date.now() });
+});
+
+// List deployed containers + their status
+app.get('/api/apps', requireApiKey, async (req, res) => {
+  try {
+    const stdout = await runCommandSilent(
+      `docker ps -a --filter "network=${PROXY_NETWORK}" --format '{{json .}}'`
+    );
+    const containers = stdout
+      .split('\n')
+      .filter(line => line.trim())
+      .map(line => {
+        try { return JSON.parse(line); }
+        catch { return null; }
+      })
+      .filter(Boolean)
+      // Exclude infrastructure containers (traefik, webhook-listener)
+      .filter(c => !['traefik', 'webhook-listener'].includes(c.Names))
+      .map(c => ({
+        id: c.Names,
+        name: c.Names,
+        containerName: c.Names,
+        image: c.Image,
+        description: `${c.Image} · ${c.Status}`,
+        status: c.State === 'running' ? 'Running' : c.State === 'exited' ? 'Error' : 'Available',
+        liveUrl: `https://${c.Names}.${DOMAIN}`,
+        ports: c.Ports || ''
+      }));
+
+    res.json({ apps: containers, domain: DOMAIN });
+  } catch (err) {
+    console.error('API /api/apps error:', err.message);
+    res.status(500).json({ error: 'Failed to list containers.', details: err.message });
+  }
+});
+
+// Trigger a new deployment (bypasses Telegram approval — desktop is a trusted admin)
+app.post('/api/deploy', requireApiKey, (req, res) => {
+  const { repoName, cloneUrl } = req.body;
+
+  if (!repoName || !cloneUrl) {
+    return res.status(400).json({ error: 'repoName and cloneUrl are required.' });
+  }
+
+  const deployId = crypto.randomUUID();
+  const emitter = new EventEmitter();
+  emitter.setMaxListeners(10);
+
+  activeDeployments.set(deployId, {
+    repoName,
+    cloneUrl,
+    status: 'started',
+    emitter,
+    logs: []
+  });
+
+  // Notify Telegram as a heads-up (no approval needed)
+  sendTelegram(`🖥️ Desktop deployment triggered for *${repoName}*...`, { parse_mode: 'Markdown' });
+
+  // Start deployment asynchronously with log streaming
+  deployWithLogs(deployId, repoName, cloneUrl);
+
+  res.status(202).json({ deployId, message: `Deployment started for ${repoName}` });
+});
+
+// SSE endpoint — stream real-time deployment logs
+app.get('/api/deploy/:id/logs', requireApiKey, (req, res) => {
+  const deployId = req.params.id;
+  const deployInfo = activeDeployments.get(deployId);
+
+  if (!deployInfo) {
+    return res.status(404).json({ error: 'Deployment not found or expired.' });
+  }
+
+  // Set up SSE headers
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+
+  // Send any logs that already accumulated
+  for (const entry of deployInfo.logs) {
+    res.write(`data: ${JSON.stringify(entry)}\n\n`);
+  }
+
+  // If already finished, close immediately
+  if (deployInfo.status === 'done' || deployInfo.status === 'error') {
+    res.write(`data: ${JSON.stringify({ type: 'end', status: deployInfo.status })}\n\n`);
+    return res.end();
+  }
+
+  // Stream new logs as they arrive
+  const onLog = (entry) => {
+    res.write(`data: ${JSON.stringify(entry)}\n\n`);
+  };
+  const onEnd = (finalStatus) => {
+    res.write(`data: ${JSON.stringify({ type: 'end', status: finalStatus })}\n\n`);
+    res.end();
+  };
+
+  deployInfo.emitter.on('log', onLog);
+  deployInfo.emitter.once('end', onEnd);
+
+  // Cleanup if client disconnects
+  req.on('close', () => {
+    deployInfo.emitter.removeListener('log', onLog);
+    deployInfo.emitter.removeListener('end', onEnd);
+  });
+});
+
+// Get status of a specific container
+app.get('/api/status/:name', requireApiKey, async (req, res) => {
+  const containerName = req.params.name;
+  try {
+    const stdout = await runCommandSilent(`docker inspect ${containerName} --format '{{json .State}}'`);
+    const state = JSON.parse(stdout.trim());
+    res.json({
+      containerName,
+      status: state.Status,
+      running: state.Running,
+      startedAt: state.StartedAt,
+      finishedAt: state.FinishedAt,
+      exitCode: state.ExitCode,
+      liveUrl: `https://${containerName}.${DOMAIN}`
+    });
+  } catch (err) {
+    res.status(404).json({ error: `Container '${containerName}' not found.`, details: err.message });
+  }
+});
+
+// =============================================
+//   Core Deployment Engine
+// =============================================
+
 const { spawn } = require('child_process');
 
-function runCommand(command, cwd = null) {
+// Silent command runner (no streaming, used by API queries)
+function runCommandSilent(command, cwd = null) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, { cwd, shell: true });
+    let stdoutData = '';
+    let stderrData = '';
+    child.stdout.on('data', (data) => { stdoutData += data.toString(); });
+    child.stderr.on('data', (data) => { stderrData += data.toString(); });
+    child.on('close', (code) => {
+      if (code !== 0) return reject(new Error(`Command failed with code ${code}: ${stderrData}`));
+      resolve(stdoutData.trim());
+    });
+  });
+}
+
+// Streaming command runner (logs to console + optional emitter for SSE)
+function runCommand(command, cwd = null, emitter = null) {
   return new Promise((resolve, reject) => {
     console.log(`[EXEC] ${command}`);
     
-    // Use spawn with shell true to stream output in real-time
     const child = spawn(command, { cwd, shell: true });
 
     let stdoutData = '';
@@ -235,13 +410,15 @@ function runCommand(command, cwd = null) {
     child.stdout.on('data', (data) => {
       const chunk = data.toString();
       stdoutData += chunk;
-      process.stdout.write(chunk); // Stream to console
+      process.stdout.write(chunk);
+      if (emitter) emitter.emit('log', { type: 'stdout', text: chunk, ts: Date.now() });
     });
 
     child.stderr.on('data', (data) => {
       const chunk = data.toString();
       stderrData += chunk;
-      process.stderr.write(chunk); // Stream to console
+      process.stderr.write(chunk);
+      if (emitter) emitter.emit('log', { type: 'stderr', text: chunk, ts: Date.now() });
     });
 
     child.on('close', (code) => {
@@ -253,7 +430,36 @@ function runCommand(command, cwd = null) {
   });
 }
 
+// Deploy function used by Telegram webhook flow (original behavior, no emitter)
 async function deploy(repoName, cloneUrl) {
+  return deployCore(repoName, cloneUrl, null);
+}
+
+// Deploy function used by Desktop API (streams logs via emitter)
+async function deployWithLogs(deployId, repoName, cloneUrl) {
+  const deployInfo = activeDeployments.get(deployId);
+  const emitter = deployInfo ? deployInfo.emitter : null;
+
+  const pushLog = (text) => {
+    const entry = { type: 'info', text, ts: Date.now() };
+    if (deployInfo) deployInfo.logs.push(entry);
+    if (emitter) emitter.emit('log', entry);
+  };
+
+  try {
+    await deployCore(repoName, cloneUrl, emitter, pushLog);
+    if (deployInfo) deployInfo.status = 'done';
+    if (emitter) emitter.emit('end', 'done');
+  } catch (err) {
+    if (deployInfo) deployInfo.status = 'error';
+    if (emitter) emitter.emit('end', 'error');
+  }
+
+  // Cleanup after 10 minutes
+  setTimeout(() => activeDeployments.delete(deployId), 10 * 60 * 1000);
+}
+
+async function deployCore(repoName, cloneUrl, emitter = null, pushLog = null) {
   const workDir = path.join('/tmp', 'repos');
   if (!fs.existsSync(workDir)) {
     fs.mkdirSync(workDir, { recursive: true });
@@ -265,6 +471,7 @@ async function deploy(repoName, cloneUrl) {
   const logToTg = (msg) => {
      console.log(msg);
      sendTelegram(`[${repoName}]: ${msg}`);
+     if (pushLog) pushLog(msg);
   };
 
   try {
@@ -274,13 +481,13 @@ async function deploy(repoName, cloneUrl) {
     }
 
     if (fs.existsSync(repoDir)) {
-      logToTg("🔄 *Pulling latest changes...*", { parse_mode: 'Markdown' });
-      await runCommand(`git fetch`, repoDir);
-      await runCommand(`git checkout ${branchName}`, repoDir);
-      await runCommand(`git reset --hard origin/${branchName}`, repoDir); 
+      logToTg("🔄 Pulling latest changes...");
+      await runCommand(`git fetch`, repoDir, emitter);
+      await runCommand(`git checkout ${branchName}`, repoDir, emitter);
+      await runCommand(`git reset --hard origin/${branchName}`, repoDir, emitter); 
     } else {
-      logToTg("📥 *Cloning repository...*", { parse_mode: 'Markdown' });
-      await runCommand(`git clone -b ${branchName} ${authenticatedCloneUrl} ${repoName}`, workDir);
+      logToTg("📥 Cloning repository...");
+      await runCommand(`git clone -b ${branchName} ${authenticatedCloneUrl} ${repoName}`, workDir, emitter);
     }
 
     if (!fs.existsSync(path.join(repoDir, 'Dockerfile'))) {
@@ -288,24 +495,23 @@ async function deploy(repoName, cloneUrl) {
     }
 
     const imageName = `${repoName}-image`;
-    logToTg(`🔨 *Building Docker image...*\n(_This step may take several minutes depending on dependencies_>`, { parse_mode: 'Markdown' });
+    logToTg(`🔨 Building Docker image (this may take a few minutes)...`);
     
-    // We try/catch build so we can stream the massive stderr chunk back to telegram natively on fail
     try {
-        await runCommand(`docker build -t ${imageName} .`, repoDir);
+        await runCommand(`docker build -t ${imageName} .`, repoDir, emitter);
     } catch (buildError) {
-        throw new Error(`Docker build failed:\n\n${buildError.message.slice(0, 3000)}`); // Telegram limits messages to 4096 chars
+        throw new Error(`Docker build failed:\n\n${buildError.message.slice(0, 3000)}`);
     }
 
     const containerName = `${repoName}-app`;
-    logToTg(`🛑 *Stopping old container...*`, { parse_mode: 'Markdown' });
+    logToTg(`🛑 Stopping old container...`);
     try {
-      await runCommand(`docker rm -f ${containerName}`);
+      await runCommand(`docker rm -f ${containerName}`, null, emitter);
     } catch (e) {
       console.log('No old container to remove.');
     }
 
-    logToTg(`🚀 *Starting new instance attached to Traefik...*`, { parse_mode: 'Markdown' });
+    logToTg(`🚀 Starting new instance attached to Traefik...`);
     const routerName = repoName.replace(/[^a-zA-Z0-9-]/g, ''); 
     const externalProxy = process.env.EXTERNAL_SSL_PROXY === 'true';
     
@@ -315,25 +521,23 @@ async function deploy(repoName, cloneUrl) {
       --label "traefik.http.routers.${routerName}.rule=Host(\\\`${repoName}.${DOMAIN}\\\`)" `;
 
     if (externalProxy) {
-      // Disable HTTPS redirection and Let's Encrypt resolver - strictly listen internally on port 80/web
       runCmd += `\\
       --label "traefik.http.routers.${routerName}.entrypoints=web" \\
       ${imageName}`;
     } else {
-      // Full standalone Render PaaS Mode - provision Let's Encrypt certificates natively
       runCmd += `\\
       --label "traefik.http.routers.${routerName}.entrypoints=websecure" \\
       --label "traefik.http.routers.${routerName}.tls.certresolver=myresolver" \\
       ${imageName}`;
     }
       
-    await runCommand(runCmd);
+    await runCommand(runCmd, null, emitter);
     
     // Fetch direct host port and public IP for debugging bypass
     let directLink = 'Not Available (App exposes no ports)';
     try {
-      const publicIp = await runCommand(`wget -qO- eth0.me || curl -sS ifconfig.me`);
-      const portOut =  await runCommand(`docker port ${containerName}`);
+      const publicIp = await runCommandSilent(`wget -qO- eth0.me || curl -sS ifconfig.me`);
+      const portOut =  await runCommandSilent(`docker port ${containerName}`);
       
       const portMatch = portOut.match(/0\.0\.0\.0:(\d+)/) || portOut.match(/:::(\d+)/);
       if (portMatch && portMatch[1]) {
@@ -344,11 +548,13 @@ async function deploy(repoName, cloneUrl) {
     }
 
     const liveUrl = `https://${repoName}.${DOMAIN}`;
-    logToTg(`✅ *Successfully deployed!*\n\n🌍 *Domain URL:*\n🔗 [${liveUrl}](${liveUrl})\n\n🛠 *Direct IP (Bypass Proxy for Debugging):*\n🔗 ${directLink}`, { parse_mode: 'Markdown', disable_web_page_preview: true });
+    logToTg(`✅ Successfully deployed!\n🌍 Domain: ${liveUrl}\n🛠 Direct: ${directLink}`);
+    sendTelegram(`✅ *Successfully deployed ${repoName}!*\n\n🔗 [${liveUrl}](${liveUrl})\n🛠 ${directLink}`, { parse_mode: 'Markdown', disable_web_page_preview: true });
 
   } catch (err) {
     console.error(`\n[!] Error: ${err.message}`);
     sendTelegram(`❌ *Deployment failed for ${repoName}:*\n\n\`\`\`text\n${err.message}\n\`\`\``, { parse_mode: 'Markdown' });
+    throw err; // Re-throw so deployWithLogs can catch it
   }
 }
 
